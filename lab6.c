@@ -1,8 +1,9 @@
+
 /**
  * Names: Kyle Ritchie, Emmett Hitz, Daniel Centore, Adam Stanczyk
  * Section: 4A
  * Date: 2015
- * Filename: lab4.c
+ * Filename: lab6.c
  * Description: TODO
  */
 
@@ -12,18 +13,15 @@
 #include <i2c.h>
 
 // Pulsewidth constants
-#define DRIVE_PW_MIN 2027
-#define DRIVE_PW_NEUT 2765
-#define DRIVE_PW_MAX 3502
-#define STEER_PW_MIN 2275
-#define STEER_PW_NEUT 2785
-#define STEER_PW_MAX 3295
+#define PW_MIN 2000
+#define PW_NEUT 2750
+#define PW_MAX 3500
 
 #define PCA_START 28672
 
-#define DIST_MAX (55 + 14)				// Distance to begin steering at
-#define DIST_AVOID_MIN (20 + 14)		// Distance before giving up at max steering
-#define DIST_STOP (12 + 14)				// Distance to stop under any conditions
+#define RANGE_MAX (60)
+#define RANGE_MIN (10)
+#define SPEED_MAX (70)
 
 //-----------------------------------------------------------------------------
 // Function Prototypes
@@ -43,46 +41,52 @@ unsigned char read_AD_input(unsigned char n);
 void Ping_Ranger(void);
 void PCA_ISR(void) __interrupt 9;
 void Update_Battery(void);
-void Pick_S_Gain(void);
-void Update_Speed(void);
-void Update_Speed(void);
+void Pick_Gains(void);
 void Process(void);
 unsigned int Read_Compass(void);
 void Paused_LCD(void);
 void Update_LCD(void);
 void Steering_Goal(void);
 void printDebug(void);
+void updatePWM();
+void Slow_Down(void);
+void Correct_Heading(void);
 
 //-----------------------------------------------------------------------------
 // Global Variables
 //-----------------------------------------------------------------------------
 
-unsigned int speed_from_pot = 0;          // The pulsewidth as calculated by the pot value
 unsigned char battery_level = 0;          // Battery voltage in volts
 
-unsigned int drive_pw = DRIVE_PW_NEUT;    // The actual pulsewidth we are driving at
-unsigned int steer_pw = STEER_PW_NEUT;    // The actual pulsewidth we are steering at
+unsigned int thrust_pw = PW_NEUT;
 
 unsigned int current_range = 0;           // The most recent ranger distance (cm)
 
 unsigned int wait = 0;                    // Elapsed 20ms ticks
 
-unsigned char new_heading_flag = 0;       // Flag to indicate new heading available (40ms)
 unsigned char new_range_flag = 0;         // Flag to indicate new range available (80ms)
 unsigned char new_battery_flag = 0;       // Flag to indicate new battery voltage (1s)
 unsigned char new_LCD_flag = 0;           // Flag to indicate we should update the LCD (400ms)
 
 unsigned char r_count = 0;                // overflow count for range
-unsigned char h_count = 0;                // overflow count for heading
 unsigned char b_count = 0;                // overflow count for battery reading
 unsigned char l_count = 0;                // overflow count for LCD reading
 
-signed int current_heading = 0;           // The most recent compass heading (10*degrees)
-signed int desired_heading = 0;           // The desired compass heading (from keypad)
+signed int current_heading = 0;
+signed int previous_heading = 0;
 
-unsigned char steering_gain = 0;          // The steering gain (from keypad)
+signed int nominal_heading = 0;
+signed int desired_heading = 0;
 
-__sbit __at 0xB7 RUN;                     // Run switch
+signed int delta_heading = 0;
+
+signed int error = 0;
+signed int previous_error = 0;
+
+unsigned char kP = 0;
+unsigned char kD = 0;
+
+__sbit __at 0xB0 USE_RANGER;
 
 /********************************************************************/
 
@@ -101,12 +105,16 @@ void main()
 	// Wait for ADC and motors to be ready
 	while (wait < 50);
 	
+	PCA0CP0 = 0xFFFF - 2750;
+	
+	wait = 0;
+	while (wait < 20);
+	
 	// Select heading and steering gain from keypad
 	Pick_Heading();
-	Pick_S_Gain();
+	Pick_Gains();
 	
-	// Updates the speed from potentiometer
-	Update_Speed();
+	printf("kP*10: %d kD:%d\r\n", kP, kD);
 	
 	// Run main loop
 	while (1)
@@ -115,44 +123,34 @@ void main()
 
 void Process()
 {
-	// Wait in neutral until switch is in run position
-	if (!RUN)
-	{
-		drive_pw = DRIVE_PW_NEUT;
-		steer_pw = STEER_PW_NEUT;
-		PCA0CP0 = 0xFFFF - steer_pw;
-		PCA0CP2 = 0xFFFF - drive_pw;
-		
-		while (!RUN)
-		{
-			// Display "Car Ready" on the LCD
-			if (new_LCD_flag)
-			{
-				Paused_LCD();
-				new_LCD_flag = 0;
-			}
-		}
-	}
-
-	// If there's a new heading available, read it and update the current value
-	// Every 40ms
-	if (new_heading_flag)
-	{
-		current_heading = Read_Compass();
-		new_heading_flag = 0;
-	}
-	
 	// If there's a new range available, read it and update the current value.
 	// Also, update drive speed and actual steering
 	// Every 80ms
 	if (new_range_flag)
 	{
-		// Update drive speed and actual steering
-		Drive_Motor();
+		current_heading = Read_Compass();
+		
+		delta_heading = current_heading - previous_heading;
+		
+		if (delta_heading > 1800)
+			delta_heading -= 3600;
+		else if (delta_heading < -1800)
+			delta_heading += 3600;
+			
+		//printf("%d\r\n", delta_heading);
+		
+		previous_heading = current_heading;
+		
+		if (abs(delta_heading) > SPEED_MAX)
+			Slow_Down();
+		else if (abs(delta_heading) != 0)
+			Correct_Heading();
 		
 		// Read ranger value and ping again
 		current_range = Read_Ranger();
 		Ping_Ranger();
+		
+		printDebug();
 		
 		new_range_flag = 0;
 	}
@@ -161,7 +159,6 @@ void Process()
 	if (new_battery_flag)
 	{
 		Update_Battery();
-		Update_Speed();
 		
 		new_battery_flag = 0;
 	}
@@ -172,6 +169,62 @@ void Process()
 		Update_LCD();
 		new_LCD_flag = 0;
 	}
+}
+
+void Slow_Down(void)
+{
+	//printf("Slow Down\r\n");
+	if (delta_heading < 0)
+		thrust_pw = (PW_MAX);
+	else
+		thrust_pw = (PW_MIN);
+	
+	updatePWM();
+}
+
+void Correct_Heading(void)
+{
+	unsigned long pw;
+	//printf("Correct Heading\r\n");
+	
+	if (current_range < RANGE_MIN)
+		current_range = RANGE_MIN;
+	else if (current_range > RANGE_MAX)
+		current_range = RANGE_MAX;
+	
+	// TODO WTF IS GOING ON HERE
+	
+	if (USE_RANGER)
+		desired_heading = nominal_heading + (long) (current_range - RANGE_MIN) * 3600 / (long) (RANGE_MAX - RANGE_MIN) - 1800;
+	else
+		desired_heading = nominal_heading;
+	
+	//printf("Des: %d Rang: %d \r\n", desired_heading, current_range);
+	
+	error = desired_heading - current_heading;
+	
+	if (error > 1800)
+		error -= 3600;
+	else if (error < -1800)
+		error += 3600;
+		
+	pw = (long) PW_NEUT + (long) kP * (long) error / 10 + (long) kD * (long) (error - previous_error);
+	
+	if (pw < PW_MIN)
+		pw = PW_MIN;
+	else if (pw > PW_MAX)
+		pw = PW_MAX;
+		
+	thrust_pw = pw;
+	
+	updatePWM();
+	
+	previous_error = error;
+}
+
+void updatePWM()
+{
+	PCA0CP0 = 0xFFFF - thrust_pw;
 }
 
 // Print "Car ready" to the LCD
@@ -186,8 +239,8 @@ void Update_LCD(void)
 {
 	lcd_clear();
 	lcd_print("Heading: %d\n", current_heading / 10);
-	lcd_print("Range: %d\n", current_range);
-	lcd_print("Steer: %ld%%\n", ((signed long) 100 * (signed long) ((signed long) steer_pw - (signed long) STEER_PW_NEUT)) / (signed long) (STEER_PW_MAX - STEER_PW_NEUT));
+	lcd_print("PW %d\n", thrust_pw);
+	lcd_print("Goal %d\n", desired_heading / 10);
 	lcd_print("Battery: %d\n", 15 * battery_level / 244);
 }
 
@@ -198,107 +251,29 @@ void Pick_Heading(void)
 		lcd_clear();
 		lcd_print("Heading (0-360):");
 			
-		desired_heading = kpd_input(1) * 10;
+		nominal_heading = kpd_input(1) * 10;
 	} while (desired_heading > 3600);
-	
 }
 
-// Asks user for steering gain
-void Pick_S_Gain(void)
+// Asks user for gains
+void Pick_Gains(void)
 {
 	lcd_clear();
-	lcd_print("Steering Gain (~33):");
-		
-	steering_gain = kpd_input(1);
-}
-
-// Actually choose drive speed and steering angle
-void Drive_Motor(void)
-{
-	unsigned int temp_steer_pw;
+	lcd_print("kP*10:");
+	kP = kpd_input(1);
 	
-	
-	if (current_range >= DIST_MAX)
-	{
-		// Range far away
-		// Going toward desired heading at speed from potentiometer
-		drive_pw = speed_from_pot;
-		Steering_Goal();
-	}
-	else if (current_range <= DIST_STOP || (current_range <= DIST_AVOID_MIN && steer_pw == STEER_PW_MIN))
-	{
-		// Range really close
-		// Stop and leave steering at previous value
-		drive_pw = DRIVE_PW_NEUT;
-	}
-	else
-	{
-		// Range at medium distance (ie obstacle detected but not too close)
-		// Steering around obstacle
-		
-		// Drive speed from pot
-		drive_pw = speed_from_pot;
-		
-		// Calculate steering to go around obstacle
-		temp_steer_pw = (STEER_PW_NEUT - steering_gain * (DIST_MAX - current_range));
-		
-		// Calculate steering toward heading for comparison
-		Steering_Goal();
-		
-		// Only adjust the steering for the obstacle if the steering to go around the obstacle is
-		//   more extreme than the steering to just continue toward the heading
-		if (temp_steer_pw < steer_pw)
-			steer_pw = temp_steer_pw;
-	}
-	
-	// Actually update drive pw
-	PCA0CP2 = 0xFFFF - drive_pw;
-	
-	// Make sure our desired steering pulsewidth is within the maximum bounds of the servo
-	if (steer_pw > STEER_PW_MAX)
-		steer_pw = STEER_PW_MAX;
-	else if (steer_pw < STEER_PW_MIN)
-		steer_pw = STEER_PW_MIN;
-	
-	// Update PCA pulsewidth steering
-    PCA0CP0 = 0xFFFF - steer_pw;
-    
-    // Print debug information to the console
-    printDebug();
+	lcd_clear();
+	lcd_print("kD:");
+	kD = kpd_input(1);
 }
 
 void printDebug(void)
 {
-	// Figure out the current error based on the desired and current heading
-	signed int steer_error = (signed int) desired_heading - (signed int) current_heading;	
-	// Shift the error to be between -1800 and 1800
-	if (steer_error > 1800)
-		steer_error -= 3600;
-	else if (steer_error < -1800)
-		steer_error += 3600;
-		
-	printf("%d, %d, %d, %d, %ld\r\n"
-			, wait * 20// + ((PCA0 - PCA_START) / (65535 - PCA_START)) * 20
-			, steer_error
-			, current_range
+	printf("%d, %d, %d\r\n"
+			, wait * 20
+			, desired_heading
 			, current_heading
-			, ((signed long) 100 * (signed long) ((signed long) steer_pw - (signed long) STEER_PW_NEUT)) / (signed long) (STEER_PW_MAX - STEER_PW_NEUT)
 		);
-}
-
-// Adjust steering pulsewidth toward desired steering
-void Steering_Goal(void)
-{
-	// Figure out the current error based on the desired and current heading
-	signed int error = (signed int) desired_heading - (signed int) current_heading;	
-	// Shift the error to be between -1800 and 1800
-	if (error > 1800)
-		error -= 3600;
-	else if (error < -1800)
-		error += 3600;
-	
-	// Figure out our desired pulsewidth using our value for k_p
-	steer_pw = STEER_PW_NEUT + 5 * error / 12;
 }
 
 // Initialize ports
@@ -344,6 +319,7 @@ void ADC_Init(void)
 	REF0CN = 0x03;
 	ADC1CF |= 0x01;
 	ADC1CN = 0x80;
+	AMX1SL = 5; // Set P1.n as the analog input for ADC1
 }
 
 // Read current compass heading
@@ -381,37 +357,13 @@ void Ping_Ranger(void)
 	i2c_write_data(addr, 0, Data , 1) ; // write one byte of data to reg 0 at addr
 }
 
-// Reads current speed PW from pot
-void Update_Speed(void)
-{
-	AMX1SL = 5; // Set P1.n as the analog input for ADC1
-	
-	printf("# SWITCHING TO POT CHANNEL...\r\n");
-	//printf("# SWITCHING TO POT CHANNEL...\r\n");
-	
-	ADC1CN = ADC1CN & ~0x20; // Clear the “Conversion Completed” flag
-	ADC1CN = ADC1CN | 0x10; // Initiate A/D conversion
-	while ((ADC1CN & 0x20) == 0x00);// Wait for conversion to complete
-	//speed_from_pot = ((DRIVE_PW_MAX-DRIVE_PW_MIN)/255)*ADC1+DRIVE_PW_MIN; 
-	//printf("ADC1: %d\r\n", ADC1);
-	speed_from_pot = ((unsigned long) (3502 - 2028) * (unsigned long) ADC1) / (unsigned long) 255 + (unsigned long) 2028;
-	//speed_from_pot = ADC1;
-}
-
 // Reads current battery 0-255 from ADC
 void Update_Battery(void)
 {
-	AMX1SL = 7; // Set P1.n as the analog input for ADC1
-	
-	printf("# SWITCHING TO BATTERY CHANNEL...\r\n");
-	//printf("# SWITCHING TO BATTERY CHANNEL...\r\n");
-
 	ADC1CN = ADC1CN & ~0x20; // Clear the “Conversion Completed” flag
 	ADC1CN = ADC1CN | 0x10; // Initiate A/D conversion
 	while ((ADC1CN & 0x20) == 0x00);// Wait for conversion to complete
 	battery_level = ADC1; // Return digital value in ADC1 register
-	
-	printf("# Battery level: %u\r\n", battery_level);
 }
 
 void PCA_ISR(void) __interrupt 9
@@ -422,13 +374,6 @@ void PCA_ISR(void) __interrupt 9
 	{
 		CF = 0;
 		PCA0 = PCA_START;
-		
-		++h_count;
-		if (h_count >= 2)		// 40 ms
-		{
-			new_heading_flag = 1;
-			h_count = 0;
-		}
 		
 		++r_count;
 		if (r_count >= 4)		// 80 ms
