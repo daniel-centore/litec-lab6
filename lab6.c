@@ -4,7 +4,9 @@
  * Section: 4A
  * Date: 2015
  * Filename: lab6.c
- * Description: TODO
+ * Description: In lab 6, an the electric compass and ranger were utilized to provide the feedback
+ *              signal to the gondola. The was spun and set at different angles, and then programmed
+ 				to correct itself to a given angle.
  */
 
 #include <c8051_SDCC.h>// include files. This file is available online
@@ -19,8 +21,10 @@
 
 #define PCA_START 28672
 
+// The minimum and maximum ranger values used to calculate the angle offset
 #define RANGE_MAX (60)
 #define RANGE_MIN (10)
+// The speed at which the "slow down" algorithm kicks in
 #define SPEED_MAX (70)
 
 //-----------------------------------------------------------------------------
@@ -33,17 +37,14 @@ void XBR0_Init(void);
 void SMB0_Init(void);
 void ADC_Init(void);
 void Pick_Heading(void);
-void Adjust_Wheels(void);
-void Drive_Motor(void);
+
 unsigned int Read_Compass(void);
 unsigned int Read_Ranger(void);
-unsigned char read_AD_input(unsigned char n);
 void Ping_Ranger(void);
 void PCA_ISR(void) __interrupt 9;
 void Update_Battery(void);
 void Pick_Gains(void);
 void Process(void);
-unsigned int Read_Compass(void);
 void Paused_LCD(void);
 void Update_LCD(void);
 void Steering_Goal(void);
@@ -72,18 +73,17 @@ unsigned char r_count = 0;                // overflow count for range
 unsigned char b_count = 0;                // overflow count for battery reading
 unsigned char l_count = 0;                // overflow count for LCD reading
 
-signed int current_heading = 0;
+signed int current_heading = 0;			  // different heading values, denoted by the first part of the variable
 signed int previous_heading = 0;
-
 signed int nominal_heading = 0;
 signed int desired_heading = 0;
-
 signed int delta_heading = 0;
 
-signed int error = 0;
+signed int error = 0;					// Error values based on heading differences, used to calculate pw
 signed int previous_error = 0;
 
-unsigned char kP = 0;
+
+unsigned char kP = 0;					// Gain values to control system responses
 unsigned char kD = 0;
 
 __sbit __at 0xB0 USE_RANGER;
@@ -132,15 +132,17 @@ void Process()
 		
 		delta_heading = current_heading - previous_heading;
 		
+		//normalize the change in heading to account for the zero crossover
 		if (delta_heading > 1800)
 			delta_heading -= 3600;
 		else if (delta_heading < -1800)
 			delta_heading += 3600;
-			
-		//printf("%d\r\n", delta_heading);
 		
+
 		previous_heading = current_heading;
 		
+
+		// check if the rotational velocity is above our speed threshhold, slow down, else correct for desired heading
 		if (abs(delta_heading) > SPEED_MAX)
 			Slow_Down();
 		else if (abs(delta_heading) != 0)
@@ -173,7 +175,7 @@ void Process()
 
 void Slow_Down(void)
 {
-	//printf("Slow Down\r\n");
+	//floors it based on our rotational velocity
 	if (delta_heading < 0)
 		thrust_pw = (PW_MAX);
 	else
@@ -185,31 +187,31 @@ void Slow_Down(void)
 void Correct_Heading(void)
 {
 	unsigned long pw;
-	//printf("Correct Heading\r\n");
 	
+	//set range within bound of our map
 	if (current_range < RANGE_MIN)
 		current_range = RANGE_MIN;
 	else if (current_range > RANGE_MAX)
 		current_range = RANGE_MAX;
 	
-	// TODO WTF IS GOING ON HERE
+	// if we're using the switch, use the ranger values to calculate a desired heading from -180 to 180 degrees
 	
 	if (USE_RANGER)
 		desired_heading = nominal_heading + (long) (current_range - RANGE_MIN) * 3600 / (long) (RANGE_MAX - RANGE_MIN) - 1800;
 	else
 		desired_heading = nominal_heading;
 	
-	//printf("Des: %d Rang: %d \r\n", desired_heading, current_range);
-	
 	error = desired_heading - current_heading;
-	
+	//normalize the error across the 0 crossover
 	if (error > 1800)
 		error -= 3600;
 	else if (error < -1800)
 		error += 3600;
 		
+	//set the pulsewidth based on our systemic gain response values
 	pw = (long) PW_NEUT + (long) kP * (long) error / 10 + (long) kD * (long) (error - previous_error);
 	
+	//make sure it's within our allowed PW range
 	if (pw < PW_MIN)
 		pw = PW_MIN;
 	else if (pw > PW_MAX)
